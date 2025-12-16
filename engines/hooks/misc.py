@@ -1,0 +1,610 @@
+import sys
+import glob
+import os
+import shutil
+import subprocess
+import time
+import gc
+import wandb
+import torch
+import torch.utils.data
+from collections import OrderedDict
+from packaging import version
+from functools import partial
+from tqdm import tqdm
+
+if sys.version_info >= (3, 10):
+    from collections.abc import Sequence
+else:
+    from collections import Sequence
+from utils.timer import Timer
+from utils.comm import is_main_process, synchronize
+from utils.cache import shared_dict
+from utils.scheduler import CosineScheduler
+import utils.comm as comm
+from engines.test import TESTERS
+
+from .default import HookBase
+from .builder import HOOKS
+
+
+AMP_DTYPE = dict(
+    float16=torch.float16,
+    bfloat16=torch.bfloat16,
+)
+
+@HOOKS.register_module()
+class IterationTimer(HookBase):
+    def __init__(self, warmup_iter=1):
+        self._warmup_iter = warmup_iter
+        self._start_time = time.perf_counter()
+        self._iter_timer = Timer()
+        self._remain_iter = 0
+
+    def before_train(self):
+        self._start_time = time.perf_counter()
+        _remain_epoch = self.trainer.max_epoch - self.trainer.start_epoch
+        self._remain_iter = _remain_epoch * len(self.trainer.train_loader)
+
+    def before_epoch(self):
+        self._iter_timer.reset()
+
+    def before_step(self):
+        data_time = self._iter_timer.seconds()
+        self.trainer.storage.put_scalar("data_time", data_time)
+
+    def after_step(self):
+        batch_time = self._iter_timer.seconds()
+        self._iter_timer.reset()
+        self.trainer.storage.put_scalar("batch_time", batch_time)
+        self._remain_iter -= 1
+        remain_time = self._remain_iter * self.trainer.storage.history("batch_time").avg
+        t_m, t_s = divmod(remain_time, 60)
+        t_h, t_m = divmod(t_m, 60)
+        remain_time = "{:02d}:{:02d}:{:02d}".format(int(t_h), int(t_m), int(t_s))
+        if "iter_info" in self.trainer.comm_info.keys():
+            info = (
+                "Data {data_time_val:.3f} ({data_time_avg:.3f}) "
+                "Batch {batch_time_val:.3f} ({batch_time_avg:.3f}) "
+                "Remain {remain_time} ".format(
+                    data_time_val=self.trainer.storage.history("data_time").val,
+                    data_time_avg=self.trainer.storage.history("data_time").avg,
+                    batch_time_val=self.trainer.storage.history("batch_time").val,
+                    batch_time_avg=self.trainer.storage.history("batch_time").avg,
+                    remain_time=remain_time,
+                )
+            )
+            self.trainer.comm_info["iter_info"] += info
+        if self.trainer.comm_info["iter"] <= self._warmup_iter:
+            self.trainer.storage.history("data_time").reset()
+            self.trainer.storage.history("batch_time").reset()
+
+
+@HOOKS.register_module()
+class InformationWriter(HookBase):
+    def __init__(self):
+        self.curr_iter = 0
+        self.model_output_keys = []
+
+    def before_train(self):
+        self.trainer.comm_info["iter_info"] = ""
+        self.curr_iter = self.trainer.start_epoch * len(self.trainer.train_loader)
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("params/*", step_metric="global_step")
+            wandb.define_metric("train_batch/*", step_metric="global_step")
+            wandb.define_metric("train/*", step_metric="epoch")
+
+    def before_step(self):
+        self.curr_iter += 1
+        info = "Train: [{epoch}/{max_epoch}][{iter}/{max_iter}] ".format(
+            epoch=self.trainer.epoch + 1,
+            max_epoch=self.trainer.max_epoch,
+            iter=self.trainer.comm_info["iter"] + 1,
+            max_iter=len(self.trainer.train_loader),
+        )
+        self.trainer.comm_info["iter_info"] += info
+
+
+    def compute_total_grad_norm(self, parameters, norm_type=2):
+        parameters = [p for p in parameters if p.grad is not None]
+        norm_list = [p.grad.detach().norm(norm_type) for p in parameters]
+        total_norm = torch.norm(torch.stack(norm_list), norm_type)
+        return total_norm
+
+    def after_step(self):
+        if "model_output_dict" in self.trainer.comm_info.keys():
+            model_output_dict = self.trainer.comm_info["model_output_dict"]
+            self.model_output_keys = model_output_dict.keys()
+            for key in self.model_output_keys:
+                self.trainer.storage.put_scalar(key, model_output_dict[key].item())
+
+        for key in self.model_output_keys:
+            self.trainer.comm_info["iter_info"] += "{key}: {value:.4f} ".format(
+                key=key, value=self.trainer.storage.history(key).val
+            )
+        lr = self.trainer.optimizer.state_dict()["param_groups"][0]["lr"]
+        self.trainer.comm_info["iter_info"] += "Lr: {lr:.5f}".format(lr=lr)
+        self.trainer.logger.info(self.trainer.comm_info["iter_info"])
+        self.trainer.comm_info["iter_info"] = ""  # reset iter info
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("params/lr", lr, self.curr_iter)
+            for key in self.model_output_keys:
+                self.trainer.writer.add_scalar(
+                    "train_batch/" + key,
+                    self.trainer.storage.history(key).val,
+                    self.curr_iter,
+                )
+            if self.trainer.cfg.enable_wandb:
+
+                wandb.log(
+                    {"global_step": self.curr_iter, 
+                     "params/lr": lr,
+                     "params/norm": self.compute_total_grad_norm(self.trainer.model.parameters(), norm_type=2.0),
+                    #  "params/mask_size": self.trainer.model.module.mask_size,
+                    #  "params/mask_ratio": self.trainer.model.module.mask_ratio,
+                    #  "params/teacher_temp": self.trainer.model.module.teacher_temp,
+                    #  "params/ema_momentum": self.trainer.model.module.momentum,
+                    #  "params/weight_decay": self.trainer.optimizer.state_dict()["param_groups"][0]["weight_decay"]
+                     }, step=self.curr_iter
+                )
+                for key in self.model_output_keys:
+                    wandb.log(
+                        {
+                            "global_step": self.curr_iter,
+                            f"train_batch/{key}": self.trainer.storage.history(key).val,
+                        },
+                        step=wandb.run.step,
+                    )
+
+    def after_epoch(self):
+        epoch_info = "Train result: "
+        for key in self.model_output_keys:
+            epoch_info += "{key}: {value:.4f} ".format(
+                key=key, value=self.trainer.storage.history(key).avg
+            )
+        self.trainer.logger.info(epoch_info)
+        if self.trainer.writer is not None:
+            for key in self.model_output_keys:
+                self.trainer.writer.add_scalar(
+                    "train/" + key,
+                    self.trainer.storage.history(key).avg,
+                    self.trainer.epoch + 1,
+                )
+
+            if self.trainer.cfg.enable_wandb:
+
+                for key in self.model_output_keys:
+                    wandb.log(
+                        {
+                            "epoch": self.trainer.epoch + 1,
+                            f"train/{key}": self.trainer.storage.history(key).avg,
+                        },
+                        step=wandb.run.step,
+                    )
+
+
+@HOOKS.register_module()
+class CheckpointSaver(HookBase):
+    def __init__(self, save_freq=None):
+        self.save_freq = save_freq  # None or int, None indicate only save model last
+
+    def after_epoch(self):
+        if is_main_process():
+            is_best = False
+            if self.trainer.cfg.evaluate:
+                current_metric_value = self.trainer.comm_info["current_metric_value"]
+                current_metric_name = self.trainer.comm_info["current_metric_name"]
+                if current_metric_value > self.trainer.best_metric_value:
+                    self.trainer.best_metric_value = current_metric_value
+                    is_best = True
+                    self.trainer.logger.info(
+                        "Best validation {} updated to: {:.4f}".format(
+                            current_metric_name, current_metric_value
+                        )
+                    )
+                self.trainer.logger.info(
+                    "Currently Best {}: {:.4f}".format(
+                        current_metric_name, self.trainer.best_metric_value
+                    )
+                )
+
+            filename = os.path.join(
+                self.trainer.cfg.save_path, "model", "model_last.pth"
+            )
+            self.trainer.logger.info("Saving checkpoint to: " + filename)
+            torch.save(
+                {
+                    "epoch": self.trainer.epoch + 1,
+                    "state_dict": self.trainer.model.state_dict(),
+                    "optimizer": self.trainer.optimizer.state_dict(),
+                    "scheduler": self.trainer.scheduler.state_dict(),
+                    "scaler": (
+                        self.trainer.scaler.state_dict()
+                        if self.trainer.cfg.enable_amp
+                        else None
+                    ),
+                    "best_metric_value": self.trainer.best_metric_value,
+                },
+                filename + ".tmp",
+            )
+            os.replace(filename + ".tmp", filename)
+            if is_best:
+                shutil.copyfile(
+                    filename,
+                    os.path.join(self.trainer.cfg.save_path, "model", "model_best.pth"),
+                )
+            if self.save_freq and (self.trainer.epoch + 1) % self.save_freq == 0:
+                shutil.copyfile(
+                    filename,
+                    os.path.join(
+                        self.trainer.cfg.save_path,
+                        "model",
+                        f"epoch_{self.trainer.epoch + 1}.pth",
+                    ),
+                )
+
+
+@HOOKS.register_module()
+class CheckpointLoader(HookBase):
+    def __init__(self, keywords="", replacement=None, strict=False):
+        self.keywords = keywords
+        self.replacement = replacement if replacement is not None else keywords
+        self.strict = strict
+
+    def before_train(self):
+        self.trainer.logger.info("=> Loading checkpoint & weight ...")
+        if self.trainer.cfg.weight and os.path.isfile(self.trainer.cfg.weight):
+            self.trainer.logger.info(f"Loading weight at: {self.trainer.cfg.weight}")
+            checkpoint = torch.load(
+                self.trainer.cfg.weight,
+                map_location=lambda storage, loc: storage.cuda(),
+                weights_only=False,
+            )
+            self.trainer.logger.info(
+                f"Loading layer weights with keyword: {self.keywords}, "
+                f"replace keyword with: {self.replacement}"
+            )
+            weight = OrderedDict()
+            for key, value in checkpoint["state_dict"].items():
+                if not key.startswith("module."):
+                    key = "module." + key  # xxx.xxx -> module.xxx.xxx
+                # Now all keys contain "module." no matter DDP or not.
+                if self.keywords in key:
+                    key = key.replace(self.keywords, self.replacement, 1)
+                if comm.get_world_size() == 1:
+                    key = key[7:]  # module.xxx.xxx -> xxx.xxx
+                weight[key] = value
+            load_state_info = self.trainer.model.load_state_dict(
+                weight, strict=self.strict
+            )
+            self.trainer.logger.info(f"Missing keys: {load_state_info[0]}")
+            self.trainer.logger.info(f"Unexpected keys: {load_state_info[1]}")
+            if self.trainer.cfg.resume:
+                self.trainer.logger.info(
+                    f"Resuming train at eval epoch: {checkpoint['epoch']}"
+                )
+                self.trainer.start_epoch = checkpoint["epoch"]
+                self.trainer.epoch = checkpoint["epoch"]
+                self.trainer.best_metric_value = checkpoint["best_metric_value"]
+                self.trainer.optimizer.load_state_dict(checkpoint["optimizer"])
+                self.trainer.scheduler.load_state_dict(checkpoint["scheduler"])
+                if self.trainer.cfg.enable_amp:
+                    self.trainer.scaler.load_state_dict(checkpoint["scaler"])
+        else:
+            self.trainer.logger.info(f"No weight found at: {self.trainer.cfg.weight}")
+
+
+
+@HOOKS.register_module()
+class PreciseEvaluator(HookBase):
+    def __init__(self, test_last=False):
+        self.test_last = test_last
+
+    def after_train(self):
+        self.trainer.logger.info(
+            ">>>>>>>>>>>>>>>> Start Precise Evaluation >>>>>>>>>>>>>>>>"
+        )
+        torch.cuda.empty_cache()
+        cfg = self.trainer.cfg
+        tester = TESTERS.build(
+            dict(type=cfg.test.type, cfg=cfg, model=self.trainer.model)
+        )
+        if self.test_last:
+            self.trainer.logger.info("=> Testing on model_last ...")
+        else:
+            self.trainer.logger.info("=> Testing on model_best ...")
+            best_path = os.path.join(
+                self.trainer.cfg.save_path, "model", "model_best.pth"
+            )
+            self.trainer.logger.info(f"Loading weight at: {best_path}")
+            checkpoint = torch.load(best_path, weights_only=False)
+            state_dict = checkpoint["state_dict"]
+            load_state_info = tester.model.load_state_dict(state_dict, strict=True)
+            self.trainer.logger.info(f"Missing keys: {load_state_info[0]}")
+            self.trainer.logger.info(f"Unexpected keys: {load_state_info[1]}")
+        tester.test()
+
+
+@HOOKS.register_module()
+class DataCacheOperator(HookBase):
+    def __init__(self, data_root, split):
+        self.data_root = data_root
+        self.split = split
+        self.data_list = self.get_data_list()
+
+    def get_data_list(self):
+        if isinstance(self.split, str):
+            data_list = glob.glob(os.path.join(self.data_root, self.split))
+        elif isinstance(self.split, Sequence):
+            data_list = []
+            for split in self.split:
+                data_list += glob.glob(os.path.join(self.data_root, split))
+        else:
+            raise NotImplementedError
+        return data_list
+
+    def get_cache_name(self, data_path):
+        data_name = data_path.replace(os.path.dirname(self.data_root), "")
+        return "pointcept" + data_name.replace(os.path.sep, "-")
+
+    def before_train(self):
+        self.trainer.logger.info(
+            f"=> Caching dataset: {self.data_root}, split: {self.split} ..."
+        )
+        if is_main_process():
+            dataset = self.trainer.train_loader.dataset
+            for i in range(len(dataset)):
+                data_dict = dataset[i]
+                name = data_dict["name"]
+                shared_dict(f"Pointcept-{name}", data_dict)
+        synchronize()
+
+
+
+@HOOKS.register_module()
+class RuntimeProfiler_training(HookBase):
+    def __init__(
+        self,
+        interrupt=True,
+        warm_up=5,
+    ):
+        self.interrupt = interrupt
+        self.warm_up = warm_up
+
+    def nvidia_smi_mem(self, device_id=0):
+        """Return memory.used (MB) for a specific GPU."""
+        cmd = f"nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i {device_id}"
+        out = subprocess.check_output(cmd.split()).decode().strip()
+        return int(out)
+
+    def before_train(self):
+        self.trainer.logger.info("Profiling runtime ...")
+
+        total_fwd_time = 0.0
+        num_batches = 0
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        # baseline driver memory
+        base_mem = self.nvidia_smi_mem(torch.cuda.current_device())
+
+        if version.parse(torch.__version__) >= version.parse("2.4"):
+            auto_cast = partial(torch.amp.autocast, device_type="cuda")
+        else:
+            # deprecated warning
+            auto_cast = torch.cuda.amp.autocast
+
+        if version.parse(torch.__version__) >= version.parse("2.4"):
+            grad_scaler = partial(torch.amp.GradScaler, device="cuda")
+        else:
+            # deprecated warning
+            grad_scaler = torch.cuda.amp.GradScaler
+        scaler = grad_scaler()
+
+        # optional warmup
+        print("\n Warming up...\n")
+        for i, input_dict in enumerate(self.trainer.train_loader):
+            if i >= self.warm_up:
+                break
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+            with auto_cast(
+                enabled=True, dtype=AMP_DTYPE['float16']
+            ):  
+                output_dict = self.trainer.model(input_dict)
+                loss = output_dict['loss']
+
+            self.trainer.optimizer.zero_grad()
+
+            scaler.scale(loss).backward()
+            scaler.step(self.trainer.optimizer)
+            scaler.update()
+            
+        print("\n Measuring inference latency across dataset...\n")
+        
+        for i, input_dict in enumerate(tqdm(self.trainer.train_loader)):
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+        
+            torch.cuda.synchronize()
+            fwd_start = time.perf_counter()
+
+            with auto_cast(
+                enabled=True, dtype=AMP_DTYPE['float16']
+            ):  
+                output_dict = self.trainer.model(input_dict)
+                loss = output_dict['loss']
+
+            self.trainer.optimizer.zero_grad()
+
+            scaler.scale(loss).backward()
+            scaler.step(self.trainer.optimizer)
+            scaler.update()
+            
+            torch.cuda.synchronize()
+            fwd_end = time.perf_counter()
+            total_fwd_time += (fwd_end - fwd_start)
+
+            num_batches += 1
+
+
+        torch.cuda.synchronize()
+        alloc_MB = torch.cuda.max_memory_allocated() / 1024**3
+        resv_MB = torch.cuda.max_memory_reserved() / 1024**3
+        smi_MB = self.nvidia_smi_mem(torch.cuda.current_device())
+        delta_MB = smi_MB - base_mem
+
+        # ---- Final report ----
+        print("\n===== Runtime Profiling Results =====")
+        print(f"Average Inference time: {total_fwd_time/num_batches*1000:.3f} ms")
+        print(f"PyTorch max_memory_allocated : {alloc_MB:.2f} GB")
+        # max_memory_reserved is used for benchmarking memory in the paper
+        print(f"PyTorch max_memory_reserved  : {resv_MB:.2f} GB")
+        print(f"nvidia-smi memory.used       : {smi_MB/1024:.3f} GB")
+        print(f"Δ from baseline              : {delta_MB/1024:.3f} GB")
+        print("=====================================\n")
+        if self.interrupt:
+            sys.exit(0)
+
+
+@HOOKS.register_module()
+class RuntimeProfiler_inference(HookBase):
+    def __init__(
+        self,
+        interrupt=True,
+        warm_up=5,
+    ):
+        self.interrupt = interrupt
+        self.warm_up = warm_up
+
+    def nvidia_smi_mem(self, device_id=0):
+        """Return memory.used (MB) for a specific GPU."""
+        cmd = f"nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i {device_id}"
+        out = subprocess.check_output(cmd.split()).decode().strip()
+        return int(out)
+
+
+    def before_train(self):
+        self.trainer.logger.info("Profiling runtime ...")
+
+        total_fwd_time = 0.0
+        num_batches = 0
+
+        self.trainer.model.eval()
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        # baseline driver memory
+        base_mem = self.nvidia_smi_mem(torch.cuda.current_device())
+
+        num_points = []
+        # optional warmup
+        print("\n Warming up...\n")
+        with torch.no_grad():
+            for i, input_dict in enumerate(self.trainer.val_loader):
+                if i >= self.warm_up:
+                    break
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+                output_dict = self.trainer.model(input_dict)
+
+
+        print("\n Measuring inference latency across dataset...\n")
+        with torch.no_grad():
+            for i, input_dict in enumerate(tqdm(self.trainer.val_loader)):
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            
+                torch.cuda.synchronize()
+                fwd_start = time.perf_counter()
+
+                output_dict = self.trainer.model(input_dict)
+                
+                torch.cuda.synchronize()
+                fwd_end = time.perf_counter()
+                total_fwd_time += (fwd_end - fwd_start)
+
+                num_batches += 1
+
+
+        torch.cuda.synchronize()
+        alloc_MB = torch.cuda.max_memory_allocated() / 1024**3
+        resv_MB = torch.cuda.max_memory_reserved() / 1024**3
+        smi_MB = self.nvidia_smi_mem(torch.cuda.current_device())
+        delta_MB = smi_MB - base_mem
+
+        # ---- Final report ----
+        print("\n===== Runtime Profiling Results =====")
+        print(f"Average Inference time: {total_fwd_time/num_batches*1000:.3f} ms")
+        print(f"PyTorch max_memory_allocated : {alloc_MB:.2f} GB")
+        # max_memory_reserved is used for benchmarking memory in the paper
+        print(f"PyTorch max_memory_reserved  : {resv_MB:.2f} GB")
+        print(f"nvidia-smi memory.used       : {smi_MB/1024:.3f} GB")
+        print(f"Δ from baseline              : {delta_MB/1024:.3f} GB")
+        print("=====================================\n")
+        if self.interrupt:
+            sys.exit(0)
+
+
+
+@HOOKS.register_module()
+class WeightDecaySchedular(HookBase):
+    def __init__(
+        self,
+        base_value=0.04,
+        final_value=0.2,
+    ):
+        self.base_value = base_value
+        self.final_value = final_value
+        self.scheduler = None
+
+    def before_train(self):
+        curr_step = self.trainer.start_epoch * len(self.trainer.train_loader)
+        self.scheduler = CosineScheduler(
+            base_value=self.base_value,
+            final_value=self.final_value,
+            total_iters=self.trainer.cfg.scheduler.total_steps,
+        )
+        self.scheduler.iter = curr_step
+
+    def before_step(self):
+        wd = self.scheduler.step()
+        for param_group in self.trainer.optimizer.param_groups:
+            param_group["weight_decay"] = wd
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("params/wd", wd, self.scheduler.iter)
+
+
+@HOOKS.register_module()
+class GarbageHandler(HookBase):
+    def __init__(self, interval=150, disable_auto=True, empty_cache=False):
+        self.interval = interval
+        self.disable_auto = disable_auto
+        self.empty_cache = empty_cache
+        self.iter = 1
+
+    def before_train(self):
+        if self.disable_auto:
+            gc.disable()
+            self.trainer.logger.info("Disable automatic garbage collection")
+
+    def before_epoch(self):
+        self.iter = 1
+
+    def after_step(self):
+        if self.iter % self.interval == 0:
+            gc.collect()
+            if self.empty_cache:
+                torch.cuda.empty_cache()
+            self.trainer.logger.info("Garbage collected")
+        self.iter += 1
+
+    def after_train(self):
+        gc.collect()
+        torch.cuda.empty_cache()
