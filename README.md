@@ -106,6 +106,13 @@ University of Zurich
 
   </details>
 
+- Optional: Install CUDA kernels for faster point cloud serialization in attention layers (automatic fallback to the original PyTorch implementation). Modify the ```all_cuda_archs``` in ```libs/serialization/setup.py``` (see PointROPE above).
+  ```shell
+  cd libs/serialization
+  python setup.py install
+  cd ../..
+  ```
+
 - Additional requirements. The requirements below are optional, and only required for evaluator and PointGroup instance segmentation. 
   * For evaluator:
     ```
@@ -129,6 +136,7 @@ Your_project/
 └── .../
     └── LitePT/
         ├── litept/
+        ├── libs/serialization
         └── libs/pointrope
 ```
 We also provide a ```demo_use.py``` script that illustrates how to use the standalone LitePT with an example point cloud input.

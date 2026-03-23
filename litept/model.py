@@ -16,7 +16,7 @@ from addict import Dict
 from timm.layers import DropPath
 
 from libs.pointrope import PointROPE
-from .serialization import encode
+from libs.serialization import encode
 
 
 @torch.no_grad()

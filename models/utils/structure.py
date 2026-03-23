@@ -5,8 +5,7 @@ import spconv.pytorch as spconv
 from addict import Dict
 from typing import List
 
-
-from models.utils.serialization import encode
+from libs.serialization import encode
 from models.utils import (
     offset2batch,
     batch2offset,
