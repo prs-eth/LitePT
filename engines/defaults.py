@@ -82,6 +82,7 @@ def default_argument_parser(epilog=None):
         default=0,
         help="the rank of this machine (unique per machine)",
     )
+    parser.add_argument("--debug", action="store_true", help="enable debug mode")
     # PyTorch still may leave orphan processes in multi-gpu training.
     # Therefore we use a deterministic way to obtain port,
     # so that users are aware of orphan processes by seeing the port occupied.

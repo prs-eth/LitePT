@@ -1,2 +1,22 @@
 data
 exp
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+
+# Native extension and package build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+.ninja_deps
+.ninja_log
+
+# Training/job outputs
+logs/
+*.err
+*.out

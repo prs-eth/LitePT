@@ -5,6 +5,7 @@ from .utils import point_collate_fn, collate_fn
 # indoor scene
 from .scannet import ScanNetDataset, ScanNet200Dataset
 from .structure3d import Structured3DDataset
+from .teeth3ds import IosDatasetTeeth3ds
 
 # outdoor scene
 from .nuscenes import NuScenesDataset

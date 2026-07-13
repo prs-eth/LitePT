@@ -15,7 +15,9 @@ def main_worker(cfg):
 
 def main():
     args = default_argument_parser().parse_args()
-
+    if args.debug:
+        import debugpy
+        debugpy.listen(("localhost", 5678))
     print("options: ", args.options)
     cfg = default_config_parser(args.config_file, args.options)
 
