@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import numpy as np
 from collections import OrderedDict
@@ -103,6 +104,59 @@ class TesterBase:
     @staticmethod
     def collate_fn(batch):
         raise collate_fn(batch)
+
+
+@TESTERS.register_module()
+class LandmarkTester(TesterBase):
+    @staticmethod
+    def collate_fn(batch):
+        return collate_fn(batch)
+
+    def test(self):
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Landmark Testing >>>>>>>>>>>>>>>>")
+        self.model.eval()
+
+        save_path = os.path.join(self.cfg.save_path, "result", "landmarks")
+        make_dirs(save_path)
+        class_names = self.cfg.data.names
+
+        for idx, input_dict in enumerate(self.test_loader):
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+            with torch.no_grad():
+                output_dict = self.model(input_dict)
+
+            names = input_dict["name"]
+            full_paths = input_dict.get("full_path", [None] * len(names))
+            for name, full_path, pred in zip(names, full_paths, output_dict["pred_landmarks"]):
+                objects = []
+                for coord, cls_idx, score in zip(pred["coord"], pred["class"], pred["score"]):
+                    cls_idx = int(cls_idx.item())
+                    objects.append(
+                        {
+                            "class": class_names[cls_idx],
+                            "coord": [float(v) for v in coord.tolist()],
+                            "score": float(score.item()),
+                        }
+                    )
+
+                result = {
+                    "version": "1.1",
+                    "description": "predicted_landmarks",
+                    "key": os.path.basename(full_path) if full_path is not None else name,
+                    "objects": objects,
+                }
+                with open(os.path.join(save_path, f"{name}__pred_kpt.json"), "w") as f:
+                    json.dump(result, f, indent=2)
+
+            logger.info(
+                "Test: [{iter}/{max_iter}] saved {batch_size} scans".format(
+                    iter=idx + 1, max_iter=len(self.test_loader), batch_size=len(names)
+                )
+            )
 
 
 @TESTERS.register_module()

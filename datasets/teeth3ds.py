@@ -94,8 +94,17 @@ class IosDatasetTeeth3ds(DefaultDataset):
         for split_file in split_files:
             split_file_path = fold_dir / split_file
             if not split_file_path.exists():
-                print(f"Warning: Split file not found: {split_file_path}")
-                continue
+                fallback_name = split_file.replace("validation_", "testing_", 1)
+                fallback_path = fold_dir / fallback_name
+                if split_file.startswith("validation_") and fallback_path.exists():
+                    print(
+                        f"Warning: Split file not found: {split_file_path}. "
+                        f"Using {fallback_path} for validation."
+                    )
+                    split_file_path = fallback_path
+                else:
+                    print(f"Warning: Split file not found: {split_file_path}")
+                    continue
 
             arch = 'lower' if 'lower' in split_file else 'upper'
             with open(split_file_path) as f:

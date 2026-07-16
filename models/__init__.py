@@ -1,5 +1,6 @@
 from .builder import build_model
 from .default import DefaultSegmentor
+from .landmark import LandmarkDetector
 from .modules import PointModule, PointModel
 
 # Backbone
