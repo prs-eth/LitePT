@@ -1,5 +1,6 @@
 data
 exp
+temp
 
 # Python runtime artifacts
 __pycache__/

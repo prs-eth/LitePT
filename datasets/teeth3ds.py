@@ -6,6 +6,7 @@ Please cite our work if the code is helpful to you.
 
 import os
 import json
+import fpsample
 import numpy as np
 import trimesh
 from copy import deepcopy
@@ -45,11 +46,18 @@ class IosDatasetTeeth3ds(DefaultDataset):
         load_segment=True,
         loop=1,
         ignore_index=0,
+        num_points=None,
+        deterministic_fps=False,
         debug=False,
     ):
         self.fold = fold
         self.debug = debug
         self.load_segment = load_segment
+        # num_points=None keeps the full scan; a value enables FPS subsampling
+        # (same scheme as Teeth3DLandmarkDataset, for backbone-compatible
+        # segmentation pretraining)
+        self.num_points = num_points
+        self.deterministic_fps = deterministic_fps or split != "train"
         self.default_mapping = DEFAULT_LABEL_MAPPING
         super().__init__(
             split=split,
@@ -145,6 +153,29 @@ class IosDatasetTeeth3ds(DefaultDataset):
             mapped[segment == orig] = mapped_label
         return mapped
 
+    def _fps_indices(self, coord):
+        num_points = int(self.num_points)
+        num_src = coord.shape[0]
+        # fallback / emergency
+        if num_points <= 0 or num_src == num_points:
+            return np.arange(num_src, dtype=np.int64)
+        if num_src < num_points:
+            if self.deterministic_fps:
+                extra = np.arange(num_points - num_src, dtype=np.int64) % num_src
+            else:
+                extra = np.random.choice(num_src, num_points - num_src, replace=True).astype(
+                    np.int64
+                )
+            return np.concatenate([np.arange(num_src, dtype=np.int64), extra])
+        # returns indices of selected points; fpsample picks a random start
+        # index unless one is given, so pin it for deterministic val/test
+        points_np = np.ascontiguousarray(coord, dtype=np.float32)
+        start_idx = 0 if self.deterministic_fps else None
+        selected = fpsample.bucket_fps_kdline_sampling(
+            points_np, num_points, h=3, start_idx=start_idx
+        )
+        return np.asarray(selected, dtype=np.int64)
+
     def get_data(self, idx, testing=False):
         file_rel_path = self.data_list[idx % len(self.data_list)]
         obj_path = os.path.join(self.data_root, file_rel_path)
@@ -159,6 +190,12 @@ class IosDatasetTeeth3ds(DefaultDataset):
             )
         else:
             segment = np.zeros(coord.shape[0], dtype=np.int32)
+
+        if self.num_points is not None:
+            fps_idx = self._fps_indices(coord)
+            coord = coord[fps_idx]
+            normal = normal[fps_idx]
+            segment = segment[fps_idx]
 
         return {
             "coord": coord,
