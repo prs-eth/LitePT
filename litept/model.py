@@ -317,13 +317,17 @@ class PointROPEAttention(PointModule):
         attn_drop=0.0,
         proj_drop=0.0,
         order_index=0,
+        attn_backend="flash",
     ):
         super().__init__()
         assert channels % num_heads == 0
+        if attn_backend not in ["flash", "torch"]:
+            raise ValueError(f"Unsupported attention backend: {attn_backend}")
         self.channels = channels
         self.num_heads = num_heads
         self.scale = qk_scale or (channels // num_heads) ** -0.5
         self.order_index = order_index
+        self.attn_backend = attn_backend
 
         self.patch_size = patch_size
         self.attn_drop = attn_drop
@@ -339,10 +343,14 @@ class PointROPEAttention(PointModule):
     def forward(self, point):
 
         H = self.num_heads
-        K = self.patch_size
         C = self.channels
 
-        pad, unpad, cu_seqlens = point.get_padding_and_inverse(self.patch_size)
+        if self.attn_backend == "flash":
+            K = self.patch_size
+        else:
+            K = min(offset2bincount(point.offset).min().tolist(), self.patch_size)
+
+        pad, unpad, cu_seqlens = point.get_padding_and_inverse(K)
 
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
@@ -362,20 +370,67 @@ class PointROPEAttention(PointModule):
         q = self.rope(q.float(), pos).to(q.dtype) # [1, H, N, head_dim] 
         k = self.rope(k.float(), pos).to(k.dtype) # [1, H, N, head_dim]
 
-        # assemble input for flash attention
-        qkv_rotated = torch.stack([
-            q.squeeze(0).transpose(0,1),
-            k.squeeze(0).transpose(0,1),
-            v.reshape(-1, H, C // H)
-        ], dim=1) # [N, 3, H, head_dim] 
+        v = v.reshape(-1, H, C // H)
 
-        feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-            qkv_rotated,
-            cu_seqlens,
-            max_seqlen=self.patch_size,
-            dropout_p=self.attn_drop if self.training else 0,
-            softmax_scale=self.scale,
-        ).reshape(-1, C)
+        # Original FlashAttention implementation, kept here for rollback:
+        # qkv_rotated = torch.stack([
+        #     q.squeeze(0).transpose(0,1),
+        #     k.squeeze(0).transpose(0,1),
+        #     v.reshape(-1, H, C // H)
+        # ], dim=1) # [N, 3, H, head_dim]
+        # feat = flash_attn.flash_attn_varlen_qkvpacked_func(
+        #     qkv_rotated,
+        #     cu_seqlens,
+        #     max_seqlen=self.patch_size,
+        #     dropout_p=self.attn_drop if self.training else 0,
+        #     softmax_scale=self.scale,
+        # ).reshape(-1, C)
+
+        if self.attn_backend == "flash":
+            # assemble input for flash attention
+            qkv_rotated = torch.stack([
+                q.squeeze(0).transpose(0,1),
+                k.squeeze(0).transpose(0,1),
+                v,
+            ], dim=1) # [N, 3, H, head_dim]
+
+            feat = flash_attn.flash_attn_varlen_qkvpacked_func(
+                qkv_rotated,
+                cu_seqlens,
+                max_seqlen=K,
+                dropout_p=self.attn_drop if self.training else 0,
+                softmax_scale=self.scale,
+            ).reshape(-1, C)
+        else:
+            # Original for-loop approach, kept here for rollback:
+            # q = q.squeeze(0) # [H, N, head_dim]
+            # k = k.squeeze(0) # [H, N, head_dim]
+            # v = v.transpose(0, 1) # [H, N, head_dim]
+            # feat = []
+            # for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+            #     start = start.item()
+            #     end = end.item()
+            #     attn = (q[:, start:end] @ k[:, start:end].transpose(-2, -1)) * self.scale
+            #     attn = self.softmax(attn)
+            #     attn = nn.functional.dropout(
+            #         attn,
+            #         p=self.attn_drop,
+            #         training=self.training,
+            #     )
+            #     feat.append((attn @ v[:, start:end]).transpose(0, 1))
+            # feat = torch.cat(feat, dim=0).reshape(-1, C)
+
+            # PTv3-style batched attention (no Python loop)
+            q = q.squeeze(0).transpose(0, 1)  # [N, H, head_dim]
+            k = k.squeeze(0).transpose(0, 1)  # [N, H, head_dim]
+            v = v                            # [N, H, head_dim]
+            q = q.reshape(-1, K, H, C // H).transpose(1, 2)  # [num_windows, H, K, head_dim]
+            k = k.reshape(-1, K, H, C // H).transpose(1, 2)
+            v = v.reshape(-1, K, H, C // H).transpose(1, 2)
+            attn = (q * self.scale) @ k.transpose(-2, -1)
+            attn = self.softmax(attn)
+            attn = nn.functional.dropout(attn, p=self.attn_drop, training=self.training)
+            feat = (attn @ v).transpose(1, 2).reshape(-1, C)
 
         feat = feat.to(qkv.dtype)
         feat = feat[inverse]
@@ -617,6 +672,7 @@ class Block(PointModule):
         enable_conv=True,
         enable_attn=True,
         rope_freq=100.0,
+        attn_backend="flash",
     ):
         super().__init__()
         self.channels = channels
@@ -655,6 +711,7 @@ class Block(PointModule):
                 attn_drop=attn_drop,
                 proj_drop=proj_drop,
                 order_index=order_index,
+                attn_backend=attn_backend,
             )
             self.norm2 = PointSequential(norm_layer(channels))
             self.mlp = PointSequential(
@@ -728,6 +785,7 @@ class LitePT(PointModule):
         pre_norm=True,
         shuffle_orders=True,
         enc_mode=False,
+        attn_backend="flash",
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -807,7 +865,8 @@ class LitePT(PointModule):
                         cpe_indice_key=f"stage{s}",
                         enable_conv=enc_conv[s],
                         enable_attn=enc_attn[s],
-                        rope_freq=enc_rope_freq[s]
+                        rope_freq=enc_rope_freq[s],
+                        attn_backend=attn_backend,
                     ),
                     name=f"block{i}",
                 )
@@ -857,7 +916,8 @@ class LitePT(PointModule):
                             cpe_indice_key=f"stage{s}",
                             enable_conv=dec_conv[s],
                             enable_attn=dec_attn[s],
-                            rope_freq=dec_rope_freq[s]
+                            rope_freq=dec_rope_freq[s],
+                            attn_backend=attn_backend,
                         ),
                         name=f"block{i}",
                     )
