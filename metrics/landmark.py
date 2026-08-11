@@ -16,6 +16,7 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 CHALLENGE_CLASSES = (
     "Mesial",
@@ -105,6 +106,80 @@ def eval_det_cls_map(pred, gt, dist_thresh):
     return rec, prec, ap
 
 
+def eval_det_cls_error(pred, gt, dist_thresh):
+    """Same greedy, confidence-sorted matching as eval_det_cls_map, but
+    returns the Euclidean distance of each matched (true-positive) pair
+    instead of a precision/recall curve.
+
+    Unmatched predictions (false positives) and unmatched GT (misses) are
+    excluded -- this is a pure localization-quality metric, kept separate
+    from the precision/recall that AP/AR already measure.
+    """
+    class_recs = {}
+    for mesh_name in gt.keys():
+        keypoints = np.array(gt[mesh_name])
+        class_recs[mesh_name] = {"kp": keypoints, "det": [False] * len(keypoints)}
+    for mesh_name in pred.keys():
+        if mesh_name not in gt:
+            class_recs[mesh_name] = {"kp": np.array([]), "det": []}
+
+    mesh_names = []
+    confidence = []
+    KP = []
+    for mesh_name in pred.keys():
+        for kp, score in pred[mesh_name]:
+            mesh_names.append(mesh_name)
+            confidence.append(score)
+            KP.append(kp)
+    confidence = np.array(confidence)
+    KP = np.array(KP)
+    sorted_ind = np.argsort(-confidence)
+    KP = KP[sorted_ind, ...]
+    mesh_names = [mesh_names[x] for x in sorted_ind]
+
+    distances = []
+    for d in range(len(mesh_names)):
+        R = class_recs[mesh_names[d]]
+        kp = KP[d]
+        KPGT = R["kp"]
+        if KPGT.size == 0:
+            continue
+        distance = np.linalg.norm(np.array(kp).reshape(-1, 3) - KPGT, axis=1)
+        dmin, jmin = distance.min(), distance.argmin()
+        if dmin < dist_thresh and not R["det"][jmin]:
+            R["det"][jmin] = True
+            distances.append(float(dmin))
+    return distances
+
+
+def error_stats(pred_all_map, gt_all, dist_thresh=3.0):
+    """Mean/std Euclidean error (mm) over matched (TP) pairs, pooled and per class.
+
+    Matching mirrors eval_det_cls_map's greedy assignment at a single fixed
+    distance threshold (default 3mm, matching LandmarkEvaluator's
+    match_distance_threshold). No penalty for unmatched predictions/GT --
+    AP/AR already measure precision/recall.
+    """
+    per_class = {}
+    pooled = []
+    for cls in CHALLENGE_CLASSES:
+        distances = eval_det_cls_error(
+            pred_all_map.get(cls, {}), gt_all.get(cls, {}), dist_thresh
+        )
+        pooled.extend(distances)
+        per_class[cls] = {
+            "error_mean_mm": float(np.mean(distances)) if distances else None,
+            "error_std_mm": float(np.std(distances)) if distances else None,
+            "n": len(distances),
+        }
+    return {
+        "error_mean_mm": float(np.mean(pooled)) if pooled else None,
+        "error_std_mm": float(np.std(pooled)) if pooled else None,
+        "error_n": len(pooled),
+        "per_class": per_class,
+    }
+
+
 def eval_map(pred_all, gt_all, dist_thresh=0.1):
     rec, prec, ap = {}, {}, {}
     for classname in gt_all.keys():
@@ -148,6 +223,18 @@ def reformat_scores(scores):
     return fmt_scores
 
 
+def project_to_surface(coords, vertices):
+    """Snap each predicted landmark to its nearest mesh vertex.
+
+    GT landmarks sit essentially on the surface while predicted offsets
+    don't, so this trims the off-surface component of the error.
+    """
+    if len(coords) == 0:
+        return coords
+    _, idx = cKDTree(vertices).query(coords)
+    return vertices[idx].astype(np.float32)
+
+
 def prediction_rows(key, pred, class_names):
     """Convert one scan's decoded landmarks to predictions.csv rows."""
     return [
@@ -175,9 +262,25 @@ def predictions_to_map(rows):
     return pred_map
 
 
-def challenge_score(rows, gold):
-    """Score prediction rows against a challenge gold dict; returns the reformatted metrics."""
-    return reformat_scores(score(gold, predictions_to_map(rows)))
+def challenge_score(rows, gold, error_dist_thresh=3.0):
+    """Score prediction rows against a challenge gold dict.
+
+    Returns the reformatted AP/AR metrics plus pooled and per-class mean/std
+    Euclidean error in mm (see error_stats) -- both single call sites
+    (LandmarkChallengeScorer, tools/eval_landmarks.py) get the error metric
+    for free.
+    """
+    pred_map = predictions_to_map(rows)
+    scores = reformat_scores(score(gold, pred_map))
+    error = error_stats(pred_map, gold, dist_thresh=error_dist_thresh)
+    scores["error_mean_mm"] = error["error_mean_mm"]
+    scores["error_std_mm"] = error["error_std_mm"]
+    scores["error_n"] = error["error_n"]
+    for cls, stats in error["per_class"].items():
+        scores[f"error_mean_mm_{cls}"] = stats["error_mean_mm"]
+        scores[f"error_std_mm_{cls}"] = stats["error_std_mm"]
+        scores[f"error_n_{cls}"] = stats["n"]
+    return scores
 
 
 def load_gold(path):

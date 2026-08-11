@@ -10,7 +10,13 @@ Usage:
         --weight exp/landmark/<exp>/model/model_best.pth \
         --split test \
         [--fold /path/to/split_folder] [--gold /path/to/gold_standard.pkl] \
-        [--output-dir /path/to/output]
+        [--output-dir /path/to/output] [--project-to-surface] \
+        [--options model.nms_radius=[0.75,0.75,0.75,0.75,0.75,0.75]]
+
+--options overrides config values without editing the config file (same
+KEY=VALUE syntax and dotted keys as tools/train.py), e.g. to try a different
+nms_radius against an already-trained checkpoint without touching the config
+that was actually used for training.
 """
 
 import argparse
@@ -29,11 +35,12 @@ from metrics.landmark import (
     gold_from_dataset,
     load_gold,
     prediction_rows,
+    project_to_surface,
     subset_gold,
     write_predictions_csv,
 )
 from models import build_model
-from utils.config import Config
+from utils.config import Config, DictAction
 
 
 def parse_args():
@@ -56,6 +63,20 @@ def parse_args():
     parser.add_argument(
         "--output-dir", default=None, help="defaults to <save_path>/eval_<split>"
     )
+    parser.add_argument(
+        "--project-to-surface", action="store_true",
+        help="snap predictions to the nearest mesh vertex",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="attach a debugpy listener on localhost:5678 before running "
+        "(same convention as tools/train.py)",
+    )
+    parser.add_argument(
+        "--options", nargs="+", action=DictAction,
+        help="override config values, e.g. --options model.nms_radius="
+        "[0.75,0.75,0.75,0.75,0.75,0.75] (same syntax as tools/train.py)",
+    )
     return parser.parse_args()
 
 
@@ -71,7 +92,12 @@ def load_weight(model, weight_path):
 
 def main():
     args = parse_args()
+    if args.debug:
+        import debugpy
+        debugpy.listen(("localhost", 5678))
     cfg = Config.fromfile(args.config_file)
+    if args.options:
+        cfg.merge_from_dict(args.options)
     class_names = cfg.data.names
 
     data_cfg = cfg.data[args.split]
@@ -94,16 +120,19 @@ def main():
         scan_path = os.path.join(dataset.data_root, rel_path)
 
         load_start = time.perf_counter()
-        coord = dataset._load_mesh(scan_path)
+        coord, normal = dataset._load_mesh(scan_path)
+        mesh_vertices = coord  # full-resolution, kept for --project-to-surface
         landmark_coord, landmark_class = dataset._load_landmarks(scan_path)
         io_time += time.perf_counter() - load_start
 
         # mirrors Teeth3DLandmarkDataset.get_data from here on
         proc_start = time.perf_counter()
-        coord = coord[dataset._fps_indices(coord)]
+        sample_idx = dataset._sample_indices(coord)
+        coord, normal = coord[sample_idx], normal[sample_idx]
         data_dict = dataset.transform(
             {
                 "coord": coord.astype(np.float32),
+                "normal": normal.astype(np.float32),
                 "landmark_coord": landmark_coord.astype(np.float32),
                 "landmark_class": landmark_class.astype(np.int64),
                 "name": Path(scan_path).stem,
@@ -122,7 +151,10 @@ def main():
         forward_time += time.perf_counter() - forward_start
 
         name = input_dict["name"][0]
-        rows.extend(prediction_rows(name, output_dict["pred_landmarks"][0], class_names))
+        pred = output_dict["pred_landmarks"][0]
+        if args.project_to_surface:
+            pred = {**pred, "coord": project_to_surface(pred["coord"].cpu().numpy(), mesh_vertices)}
+        rows.extend(prediction_rows(name, pred, class_names))
         proc_time += time.perf_counter() - proc_start
         print(f"[{idx + 1}/{num_scans}] {name}")
     total_time = time.perf_counter() - start

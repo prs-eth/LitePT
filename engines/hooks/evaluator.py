@@ -22,6 +22,7 @@ from metrics.landmark import (
     gold_from_dataset,
     load_gold,
     prediction_rows,
+    project_to_surface,
     subset_gold,
 )
 from metrics.semantic import ConfusionMatrix
@@ -29,6 +30,37 @@ from metrics.semantic import ConfusionMatrix
 from torch_scatter import scatter_mean
 from torch.nn.functional import normalize
 from tqdm import tqdm
+
+
+def _mesh_vertices_for_batch(dataset, names, full_paths, cache):
+    """Look up each scan's full-resolution mesh vertices, caching per name.
+
+    Used to snap predictions back onto the mesh surface -- the model only
+    ever sees the FPS/random-subsampled points, so this reloads the full
+    mesh the dataset already read once (and discarded) while building the
+    batch.
+    """
+    vertices = []
+    for name, full_path in zip(names, full_paths):
+        if name not in cache:
+            cache[name] = dataset._load_mesh(full_path)[0]
+        vertices.append(cache[name])
+    return vertices
+
+
+def _project_predictions_to_surface(pred_landmarks, vertices_list):
+    projected = []
+    for pred, vertices in zip(pred_landmarks, vertices_list):
+        coord = pred["coord"]
+        if coord.shape[0] == 0:
+            projected.append(pred)
+            continue
+        snapped = project_to_surface(coord.detach().cpu().numpy(), vertices)
+        projected.append(
+            {**pred, "coord": torch.from_numpy(snapped).to(device=coord.device, dtype=coord.dtype)}
+        )
+    return projected
+
 
 @HOOKS.register_module()
 class LandmarkEvaluator(HookBase):
@@ -40,6 +72,7 @@ class LandmarkEvaluator(HookBase):
         max_monitor_values=200000,
         debug_top_candidates_per_class=1,
         match_distance_threshold=3.0,
+        project_to_surface=False,
     ):
         self.output_dir_name = output_dir_name
         self.max_visualization_scans = max_visualization_scans
@@ -49,6 +82,9 @@ class LandmarkEvaluator(HookBase):
         # maximum prediction-GT distance (original units, mm) for a Hungarian
         # pair to count as a match in precision/recall/mean_error
         self.match_distance_threshold = match_distance_threshold
+        # snap predictions to the nearest mesh vertex before scoring/visualizing
+        self.project_to_surface = project_to_surface
+        self._mesh_cache = {}
 
     def before_train(self):
         if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
@@ -86,7 +122,17 @@ class LandmarkEvaluator(HookBase):
             loss_sum += loss.detach()
             batch_count += 1
 
-            metric = self._compute_batch_metric(input_dict, output_dict["pred_landmarks"])
+            pred_landmarks = output_dict["pred_landmarks"]
+            if self.project_to_surface:
+                vertices_list = _mesh_vertices_for_batch(
+                    self.trainer.val_loader.dataset,
+                    input_dict["name"],
+                    input_dict["full_path"],
+                    self._mesh_cache,
+                )
+                pred_landmarks = _project_predictions_to_surface(pred_landmarks, vertices_list)
+
+            metric = self._compute_batch_metric(input_dict, pred_landmarks)
             error_sum += metric["error_sum"]
             match_count += metric["match_count"]
             gt_count += metric["gt_count"]
@@ -98,7 +144,7 @@ class LandmarkEvaluator(HookBase):
                 )
             batch_records, batch_visualizations = self._build_prediction_records(
                 input_dict,
-                output_dict["pred_landmarks"],
+                pred_landmarks,
                 remaining_visualizations,
                 output_dict,
             )
@@ -654,11 +700,14 @@ class LandmarkChallengeScorer(HookBase):
     a gold_standard.pkl if given, otherwise from the splits' __kpt.json files.
     """
 
-    def __init__(self, splits=("val", "test"), gold_path=None):
+    def __init__(self, splits=("val", "test"), gold_path=None, project_to_surface=False):
         self.splits = splits
         self.gold_path = gold_path
+        # snap predictions to the nearest mesh vertex before scoring
+        self.project_to_surface = project_to_surface
         self.loaders = {}
         self.gold = {}
+        self._mesh_cache = {}
 
     def before_train(self):
         if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
@@ -714,13 +763,23 @@ class LandmarkChallengeScorer(HookBase):
 
         for split in self.splits:
             rows_by_scan = {}
+            mesh_cache = self._mesh_cache.setdefault(split, {})
             for input_dict in self.loaders[split]:
                 for key in input_dict.keys():
                     if isinstance(input_dict[key], torch.Tensor):
                         input_dict[key] = input_dict[key].cuda(non_blocking=True)
                 with torch.no_grad():
                     output_dict = self.trainer.model(input_dict)
-                for name, pred in zip(input_dict["name"], output_dict["pred_landmarks"]):
+                pred_landmarks = output_dict["pred_landmarks"]
+                if self.project_to_surface:
+                    vertices_list = _mesh_vertices_for_batch(
+                        self.loaders[split].dataset,
+                        input_dict["name"],
+                        input_dict["full_path"],
+                        mesh_cache,
+                    )
+                    pred_landmarks = _project_predictions_to_surface(pred_landmarks, vertices_list)
+                for name, pred in zip(input_dict["name"], pred_landmarks):
                     rows_by_scan[name] = prediction_rows(name, pred, class_names)
 
             if comm.get_world_size() > 1:
@@ -742,7 +801,11 @@ class LandmarkChallengeScorer(HookBase):
                 )
             )
             if self.trainer.writer is not None:
-                for key, value in scores.items():
+                # error_mean_mm/error_std_mm can be None (no matched pairs
+                # for a class yet, e.g. early epochs) -- skip those rather
+                # than feeding None into add_scalar/wandb
+                loggable = {k: v for k, v in scores.items() if v is not None}
+                for key, value in loggable.items():
                     self.trainer.writer.add_scalar(
                         f"{split}/challenge/{key}", value, current_epoch
                     )
@@ -750,7 +813,7 @@ class LandmarkChallengeScorer(HookBase):
                     wandb.log(
                         {
                             "Epoch": current_epoch,
-                            **{f"{split}/challenge/{key}": value for key, value in scores.items()},
+                            **{f"{split}/challenge/{key}": value for key, value in loggable.items()},
                         },
                         step=wandb.run.step,
                     )

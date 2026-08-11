@@ -7,6 +7,19 @@ ignore_index = -1
 num_points = 8192
 grid_size = 0.01
 
+# auxiliary supervision: classify each predicted landmark's tooth index, with
+# ground truth taken from the Teeth3DS segmentation mask's nearest vertex to
+# the landmark. Flip to True to enable -- drives the dataset's load_segment,
+# the model's tooth head/loss, and the collected keys below.
+predict_tooth = False
+num_tooth_classes = 17  # background (0) + 16 FDI tooth positions
+
+# snap predicted landmarks to the nearest mesh vertex before scoring in the
+# val/test loops (LandmarkEvaluator, LandmarkChallengeScorer) -- trims the
+# off-surface component of the error, since GT landmarks sit on the surface
+# while raw predicted offsets don't.
+project_to_surface = False
+
 batch_size = 2
 batch_size_val = 1
 batch_size_test = 1
@@ -35,6 +48,9 @@ model = dict(
     score_threshold=0.5,
     nms_radius=2.0,
     max_predictions_per_class=32,
+    predict_tooth=predict_tooth,
+    num_tooth_classes=num_tooth_classes,
+    lambda_tooth=1.0,
     backbone=dict(
         type="LitePT",
         in_channels=3,
@@ -84,6 +100,10 @@ dataset_type = "Teeth3DLandmarkDataset"
 data_root = "/homes/mlugli/BracketPrediction/Teeth3DS/original_data"
 fold = "/homes/mlugli/BracketPrediction/Teeth3DS/splits/3DTeethland_challenge_train_test_split_original"
 feat_keys = ["coord"]
+# "fps": farthest-point sampling, uniform over mesh surface area.
+# "random": uniform over mesh vertices, so it follows the scanner's own
+# triangulation density (typically denser around teeth than gum/base).
+sampling = "fps"
 collect_keys = [
     "coord",
     "grid_coord",
@@ -94,6 +114,8 @@ collect_keys = [
     "name",
     "full_path",
 ]
+if predict_tooth:
+    collect_keys.append("landmark_tooth")
 offset_keys = dict(offset="coord", landmark_offset="landmark_coord")
 
 data = dict(
@@ -106,6 +128,8 @@ data = dict(
         fold=fold,
         data_root=data_root,
         num_points=num_points,
+        sampling=sampling,
+        load_segment=predict_tooth,
         ignore_index=ignore_index,
         transform=[
             dict(type="RandomRotate", angle=[-0.1, 0.1], axis="z", p=0.5),
@@ -129,6 +153,8 @@ data = dict(
         fold=fold,
         data_root=data_root,
         num_points=num_points,
+        sampling=sampling,
+        load_segment=predict_tooth,
         deterministic_fps=True,
         ignore_index=ignore_index,
         transform=[
@@ -150,6 +176,8 @@ data = dict(
         fold=fold,
         data_root=data_root,
         num_points=num_points,
+        sampling=sampling,
+        load_segment=predict_tooth,
         deterministic_fps=True,
         ignore_index=ignore_index,
         transform=[
@@ -172,10 +200,19 @@ hooks = [
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
-    dict(type="LandmarkEvaluator", match_distance_threshold=3.0),
+    dict(
+        type="LandmarkEvaluator",
+        match_distance_threshold=3.0,
+        project_to_surface=project_to_surface,
+    ),
     # gold_path=None derives GT from the splits' __kpt.json files;
     # set it to a gold_standard.pkl to score against a fixed pickle instead
-    dict(type="LandmarkChallengeScorer", splits=("val", "test"), gold_path=None),
+    dict(
+        type="LandmarkChallengeScorer",
+        splits=("val", "test"),
+        gold_path=None,
+        project_to_surface=project_to_surface,
+    ),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="PreciseEvaluator", test_last=False),
 ]
