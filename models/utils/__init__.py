@@ -5,4 +5,3 @@ from .misc import (
     batch2offset,
     off_diagonal,
 )
-from .serialization import encode, decode
