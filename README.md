@@ -33,13 +33,13 @@ University of Zurich
 ## Preparation
 
 ### Environment
-- Create an environment and install pytorch and other required packages:
+- Create an environment and install PyTorch and other required packages:
   ```shell
   git clone https://github.com/prs-eth/LitePT.git
   cd LitePT
   conda create -n litept python=3.10
   conda activate litept
-  # install pytorch, adjusting the command to match your cuda version
+  # install PyTorch, adjusting the command to match your CUDA version
   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
   # install some other packages
   pip install -r requirements.txt
@@ -86,7 +86,7 @@ University of Zurich
       <td>4.1G</td>
     </tr>
     <tr>
-      <td>LitePT-S (Pure Torch PointROPE)</td>
+      <td>LitePT-S (Pure PyTorch PointROPE)</td>
       <td>12.7M</td>
       <td>78ms</td>
       <td>2.4G</td>
@@ -134,7 +134,7 @@ Your_project/
 We also provide a ```demo_use.py``` script that illustrates how to use the standalone LitePT with an example point cloud input.
 
 ### Data
-We prepare and organize the data in the same way with Pointcept [Data Preparation](https://github.com/Pointcept/Pointcept#data-preparation). All data should be placed in ```LitePT/data```.
+We prepare and organize the data in the same way as Pointcept [Data Preparation](https://github.com/Pointcept/Pointcept#data-preparation). All data should be placed in ```LitePT/data```.
 
 
 ## Model Zoo
@@ -154,6 +154,7 @@ We prepare and organize the data in the same way with Pointcept [Data Preparatio
 |:-|-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | LitePT-S* | 16.0M | ScanNet | 78.5 | 64.9 | 41.7 | [link](https://github.com/prs-eth/LitePT/blob/main/configs/scannet/insseg-litept-small-v1m2.py) | [Download](https://huggingface.co/prs-eth/LitePT/blob/main/scannet-insseg-litept-small-v1m2/model/model_best.pth) |
 | LitePT-S* | 16.0M | ScanNet200 | 40.3 | 33.1 | 22.2 | [link](https://github.com/prs-eth/LitePT/blob/main/configs/scannet200/insseg-litept-small-v1m2.py) | [Download](https://huggingface.co/prs-eth/LitePT/blob/main/scannet200-insseg-litept-small-v1m2/model/model_best.pth) |
+
 ### Object detection
 | Model | Params | Benchmark  | mAPH | Config | Checkpoint |
 |:-|-:|:-:|:-:|:-:|:-:|
