@@ -13,6 +13,15 @@ from utils.registry import Registry
 
 TRANSFORMS = Registry("transforms")
 
+LANDMARK_COORD_KEYS = ("landmark_coord",)
+
+
+def transform_extra_coords(data_dict, transform_fn):
+    for key in LANDMARK_COORD_KEYS:
+        if key in data_dict and data_dict[key].size > 0:
+            data_dict[key] = transform_fn(data_dict[key])
+    return data_dict
+
 
 def index_operator(data_dict, index, duplicate=False):
     # index selection operator for keys in "index_valid_keys"
@@ -143,7 +152,10 @@ class NormalizeCoord(object):
             centroid = np.mean(data_dict["coord"], axis=0)
             data_dict["coord"] -= centroid
             m = np.max(np.sqrt(np.sum(data_dict["coord"] ** 2, axis=1)))
+            data_dict["coord_center"] = centroid.reshape(1, 3).astype(np.float32)
+            data_dict["coord_scale"] = np.array([m], dtype=np.float32)
             data_dict["coord"] = data_dict["coord"] / m
+            transform_extra_coords(data_dict, lambda coord: (coord - centroid) / m)
         return data_dict
 
 
@@ -153,6 +165,7 @@ class PositiveShift(object):
         if "coord" in data_dict.keys():
             coord_min = np.min(data_dict["coord"], 0)
             data_dict["coord"] -= coord_min
+            transform_extra_coords(data_dict, lambda coord: coord - coord_min)
         return data_dict
 
 
@@ -170,6 +183,7 @@ class CenterShift(object):
             else:
                 shift = [(x_min + x_max) / 2, (y_min + y_max) / 2, 0]
             data_dict["coord"] -= shift
+            transform_extra_coords(data_dict, lambda coord: coord - shift)
         return data_dict
 
 
@@ -184,6 +198,9 @@ class RandomShift(object):
             shift_y = np.random.uniform(self.shift[1][0], self.shift[1][1])
             shift_z = np.random.uniform(self.shift[2][0], self.shift[2][1])
             data_dict["coord"] += [shift_x, shift_y, shift_z]
+            transform_extra_coords(
+                data_dict, lambda coord: coord + [shift_x, shift_y, shift_z]
+            )
         return data_dict
 
 
@@ -257,6 +274,10 @@ class RandomRotate(object):
             data_dict["coord"] -= center
             data_dict["coord"] = np.dot(data_dict["coord"], np.transpose(rot_t))
             data_dict["coord"] += center
+            transform_extra_coords(
+                data_dict,
+                lambda coord: np.dot(coord - center, np.transpose(rot_t)) + center,
+            )
         if "normal" in data_dict.keys():
             data_dict["normal"] = np.dot(data_dict["normal"], np.transpose(rot_t))
         return data_dict
@@ -296,6 +317,10 @@ class RandomRotateTargetAngle(object):
             data_dict["coord"] -= center
             data_dict["coord"] = np.dot(data_dict["coord"], np.transpose(rot_t))
             data_dict["coord"] += center
+            transform_extra_coords(
+                data_dict,
+                lambda coord: np.dot(coord - center, np.transpose(rot_t)) + center,
+            )
         if "normal" in data_dict.keys():
             data_dict["normal"] = np.dot(data_dict["normal"], np.transpose(rot_t))
         return data_dict
@@ -313,6 +338,7 @@ class RandomScale(object):
                 self.scale[0], self.scale[1], 3 if self.anisotropic else 1
             )
             data_dict["coord"] *= scale
+            transform_extra_coords(data_dict, lambda coord: coord * scale)
         return data_dict
 
 
@@ -325,11 +351,19 @@ class RandomFlip(object):
         if np.random.rand() < self.p:
             if "coord" in data_dict.keys():
                 data_dict["coord"][:, 0] = -data_dict["coord"][:, 0]
+                transform_extra_coords(
+                    data_dict,
+                    lambda coord: coord * np.array([-1, 1, 1], dtype=coord.dtype),
+                )
             if "normal" in data_dict.keys():
                 data_dict["normal"][:, 0] = -data_dict["normal"][:, 0]
         if np.random.rand() < self.p:
             if "coord" in data_dict.keys():
                 data_dict["coord"][:, 1] = -data_dict["coord"][:, 1]
+                transform_extra_coords(
+                    data_dict,
+                    lambda coord: coord * np.array([1, -1, 1], dtype=coord.dtype),
+                )
             if "normal" in data_dict.keys():
                 data_dict["normal"][:, 1] = -data_dict["normal"][:, 1]
         return data_dict
@@ -803,6 +837,21 @@ class ElasticDistortion(object):
                     data_dict["coord"] = self.elastic_distortion(
                         data_dict["coord"], granularity, magnitude
                     )
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class GridCoord(object):
+    def __init__(self, grid_size=1.0):
+        self.grid_size = grid_size
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict.keys()
+        grid_coord = np.floor(data_dict["coord"] / np.array(self.grid_size)).astype(int)
+        grid_coord -= grid_coord.min(0)
+        data_dict["grid_coord"] = grid_coord
+        if "index_valid_keys" in data_dict:
+            data_dict["index_valid_keys"].append("grid_coord")
         return data_dict
 
 
